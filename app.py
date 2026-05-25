@@ -68,7 +68,7 @@ TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "25"))
 
 # ScraperAPI key rotasyonu
 _RAW_KEYS = [
-    os.getenv("SCRAPER_API_KEY_1", ""),
+    os.getenv("SCRAPER_API_KEY_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
     os.getenv("SCRAPER_API_KEY_2", ""),
     os.getenv("SCRAPER_API_KEY_3", ""),
     os.getenv("SCRAPER_API_KEY_4", ""),
