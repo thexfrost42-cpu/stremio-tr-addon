@@ -1,5 +1,4 @@
 import asyncio
-import concurrent.futures
 import gc
 import logging
 import os
@@ -11,10 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any, Tuple
 
 from bs4 import BeautifulSoup
-from curl_cffi import requests as cffi_requests
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -28,22 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── RENDER RAM KORUMASI (Lifespan Event) ─────────────────
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Uygulama başlarken Event Loop'un kullanacağı maksimum Thread sayısını (3) belirler.
-    Bu, aynı anda onlarca tarama yapılıp RAM'in (%100) dolmasını ve 
-    Render'ın uygulamayı öldürmesini (Shutdown) kesin olarak engeller.
-    """
-    loop = asyncio.get_running_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-    loop.set_default_executor(executor)
-    logger.info("🛡️ Thread Havuzu aktifleştirildi (Max Workers: 3)")
-    yield
-    executor.shutdown(wait=False)
-
-app = FastAPI(title="TR Sinema Paketi Addon", lifespan=lifespan)
+app = FastAPI(title="TR Sinema Paketi Addon")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,7 +49,7 @@ MANIFEST: Dict[str, Any] = {
 }
 
 # ─────────────────────────────────────────────────────────
-# FAZ 4: DİNAMİK DOMAIN YÖNETİMİ & RETRY MEKANİZMASI
+# FAZ 4: DİNAMİK DOMAIN YÖNETİMİ & ASYNC RETRY
 # ─────────────────────────────────────────────────────────
 DOMAINS_JSON_URL = os.getenv(
     "DOMAINS_JSON_URL",
@@ -86,49 +67,30 @@ CURRENT_ACTIVE_DOMAINS: Dict[str, str] = dict(_FALLBACK_DOMAINS)
 _DOMAINS_CACHE_TTL   = 21_600  # 6 saat
 _domains_last_fetch  = 0.0
 
-def _get_retry_session() -> requests.Session:
-    """GitHub veya diğer stabil API'ler için Retry özellikli Session oluşturur."""
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-def _fetch_domains_sync() -> Optional[Dict[str, str]]:
-    try:
-        with _get_retry_session() as s:
-            r = s.get(DOMAINS_JSON_URL, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict) and all(isinstance(v, str) for v in data.values()):
-                return data
-    except Exception as e:
-        logger.warning(f"⚠️ Dinamik domain listesi çekilemedi, yedek devreye giriyor: {e}")
-    return None
-
 async def refresh_domains_if_needed() -> None:
     global CURRENT_ACTIVE_DOMAINS, _domains_last_fetch
     if time.time() - _domains_last_fetch < _DOMAINS_CACHE_TTL:
         return
     
-    fresh_domains = await asyncio.to_thread(_fetch_domains_sync)
-    if fresh_domains:
-        CURRENT_ACTIVE_DOMAINS = fresh_domains
-        _domains_last_fetch = time.time()
-        logger.info(f"✅ Domain listesi güncellendi: {list(fresh_domains.keys())}")
-    else:
-        if not _domains_last_fetch:
-            CURRENT_ACTIVE_DOMAINS = dict(_FALLBACK_DOMAINS)
-        _domains_last_fetch = time.time() 
+    try:
+        async with AsyncSession() as s:
+            r = await s.get(DOMAINS_JSON_URL, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict) and all(isinstance(v, str) for v in data.values()):
+                    CURRENT_ACTIVE_DOMAINS = data
+                    _domains_last_fetch = time.time()
+                    logger.info(f"✅ Domain listesi GitHub'dan güncellendi.")
+                    return
+    except Exception as e:
+        logger.warning(f"⚠️ Dinamik domain çekilemedi (Yedek devrede): {e}")
+    
+    if not _domains_last_fetch:
+        CURRENT_ACTIVE_DOMAINS = dict(_FALLBACK_DOMAINS)
+    _domains_last_fetch = time.time()
 
 # ─────────────────────────────────────────────────────────
-# FAZ 2: DOMAIN İZLEME & ANALİZ
+# DOMAIN İZLEME & ANALİZ
 # ─────────────────────────────────────────────────────────
 DOMAIN_STATS: Dict[str, Dict[str, int]] = {
     key: {"success": 0, "fail": 0} for key in _FALLBACK_DOMAINS
@@ -153,12 +115,12 @@ def get_domain_health() -> Dict[str, Any]:
 # CACHE & TOKEN YÖNETİMİ
 # ─────────────────────────────────────────────────────────
 STREAM_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 3600  # 1 Saat
-REQUEST_TIMEOUT = 5
+CACHE_TTL = 3600  
+REQUEST_TIMEOUT = 9  # Loglardaki curl(28) hatasını önlemek için 9 saniyeye esnetildi (Stremio limiti ~10s)
 
 _RAW_TOKENS = [
     os.getenv("SCRAPEDO_KEY_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
-    os.getenv("SCRAPEDO_KEY_2", "ad94f3583fe44d0ca3635c5af37b73f2c64d90c0a59"),
+    os.getenv("SCRAPEDO_KEY_2", ""),
     os.getenv("SCRAPEDO_KEY_3", ""),
     os.getenv("SCRAPEDO_KEY_4", ""),
 ]
@@ -176,9 +138,9 @@ def rotate_token() -> None:
         logger.warning(f"🔄 Token rotasyonu: {_token_index + 1}. token devrede.")
 
 # ─────────────────────────────────────────────────────────
-# HTTP KATMANI (curl_cffi via scrape.do)
+# SAF ASENKRON HTTP KATMANI (curl_cffi AsyncSession)
 # ─────────────────────────────────────────────────────────
-def sync_fetch_html(url: str) -> Optional[str]:
+async def fetch_html(url: str) -> Optional[str]:
     token = get_active_token()
     if not token:
         logger.error("🛑 Aktif scrape.do tokeni bulunamadı!")
@@ -188,8 +150,9 @@ def sync_fetch_html(url: str) -> Optional[str]:
     proxy_url = f"https://api.scrape.do?token={token}&url={encoded_target}"
 
     try:
-        with cffi_requests.Session(impersonate="chrome120") as s:
-            r = s.get(proxy_url, timeout=REQUEST_TIMEOUT)
+        # Arka planda OS thread'i açmadan saf asenkron istek atıyoruz (Sıfır RAM Şişmesi)
+        async with AsyncSession(impersonate="chrome120") as s:
+            r = await s.get(proxy_url, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 return r.text
             if r.status_code in (401, 403, 429):
@@ -200,33 +163,27 @@ def sync_fetch_html(url: str) -> Optional[str]:
         logger.error(f"⚠️ Proxy bağlantı hatası [{url}]: {e}")
         return None
 
-async def fetch_html(url: str) -> Optional[str]:
-    return await asyncio.to_thread(sync_fetch_html, url)
-
 # ─────────────────────────────────────────────────────────
-# METADATA (Cinemeta)
+# ASYNC METADATA (Cinemeta)
 # ─────────────────────────────────────────────────────────
 _CINEMETA_SUFFIX_RE = re.compile(r"\s*\((movie|series|show)\)\s*$", re.IGNORECASE)
 
-def get_cinemeta_sync(imdb_id: str, video_type: str) -> str:
+async def get_media_name(imdb_id: str, video_type: str) -> str:
     pure_id = imdb_id.split(":")[0]
     url = f"https://v3-cinemeta.strem.io/meta/{video_type}/{pure_id}.json"
     try:
-        with _get_retry_session() as s:
-            r = s.get(url, timeout=5)
-            r.raise_for_status()
-            name: str = r.json().get("meta", {}).get("name", "")
-            if name:
-                return _CINEMETA_SUFFIX_RE.sub("", name).strip()
+        async with AsyncSession() as s:
+            r = await s.get(url, timeout=6)
+            if r.status_code == 200:
+                name: str = r.json().get("meta", {}).get("name", "")
+                if name:
+                    return _CINEMETA_SUFFIX_RE.sub("", name).strip()
     except Exception as e:
         logger.error(f"⚠️ Cinemeta hatası [{pure_id}]: {e}")
     return pure_id
 
-async def get_media_name(imdb_id: str, video_type: str) -> str:
-    return await asyncio.to_thread(get_cinemeta_sync, imdb_id, video_type)
-
 # ─────────────────────────────────────────────────────────
-# FAZ 3: PLAYER RANKING
+# PLAYER RANKING & UTILS
 # ─────────────────────────────────────────────────────────
 _PLAYER_PRIORITY: Dict[str, int] = {
     "Hızlı Player ⚡": 1,
@@ -249,12 +206,8 @@ def rank_streams(streams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return 50 
     return sorted(streams, key=_score)
 
-# ─────────────────────────────────────────────────────────
-# UTILS & PARSERS
-# ─────────────────────────────────────────────────────────
 def to_slug(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     tr_map = str.maketrans("çğışöüÇĞİŞÖÜ", "cgisoucgisou")
     text = text.translate(tr_map)
     text = unicodedata.normalize("NFKD", text)
@@ -278,8 +231,7 @@ def extract_iframes(soup: BeautifulSoup, source_name: str, emoji: str) -> List[D
     found: List[Dict[str, Any]] = []
     for iframe in soup.find_all("iframe"):
         src: str = iframe.get("src", "").strip()
-        if src.startswith("//"):
-            src = "https:" + src
+        if src.startswith("//"): src = "https:" + src
         if src and (src.startswith("http://") or src.startswith("https://")):
             provider_title = detect_player_provider(src)
             found.append({
@@ -336,7 +288,7 @@ def get_episode_link(soup: BeautifulSoup, domain: str, season: str, episode: str
     return None
 
 # ─────────────────────────────────────────────────────────
-# SCRAPER MİMARİSİ
+# CORE SCRAPER MİMARİSİ
 # ─────────────────────────────────────────────────────────
 async def _base_scraper(
     key: str, source_name: str, emoji: str, 
@@ -350,7 +302,8 @@ async def _base_scraper(
     if not search_html:
         record_domain_status(key, False); return streams
 
-    target_url = get_best_search_result(BeautifulSoup(search_html, "lxml"), name, video_type, domain)
+    # RAM dostu dahili html.parser kullanarak sayfayı işliyoruz
+    target_url = get_best_search_result(BeautifulSoup(search_html, "html.parser"), name, video_type, domain)
     if not target_url:
         record_domain_status(key, False); return streams
 
@@ -358,14 +311,14 @@ async def _base_scraper(
         main_html = await fetch_html(target_url)
         if not main_html:
             record_domain_status(key, False); return streams
-        ep_url = get_episode_link(BeautifulSoup(main_html, "lxml"), domain, season, episode)
+        ep_url = get_episode_link(BeautifulSoup(main_html, "html.parser"), domain, season, episode)
         if not ep_url:
             record_domain_status(key, False); return streams
         target_url = ep_url
 
     page_html = await fetch_html(target_url)
     if page_html:
-        streams.extend(extract_iframes(BeautifulSoup(page_html, "lxml"), source_name, emoji))
+        streams.extend(extract_iframes(BeautifulSoup(page_html, "html.parser"), source_name, emoji))
         record_domain_status(key, True)
     else:
         record_domain_status(key, False)
@@ -417,7 +370,7 @@ async def get_stream(video_type: str, imdb_id: str) -> Dict[str, Any]:
     if cache_key in STREAM_CACHE:
         cached = STREAM_CACHE[cache_key]
         if current_time - cached["timestamp"] < CACHE_TTL:
-            logger.info(f"⚡ Önbellekten yüklendi: {imdb_id} (0 Kredi)")
+            logger.info(f"⚡ Önbellekten yüklendi: {imdb_id}")
             return {"streams": cached["streams"]}
         del STREAM_CACHE[cache_key]
 
@@ -426,7 +379,7 @@ async def get_stream(video_type: str, imdb_id: str) -> Dict[str, Any]:
     episode = parts[2] if len(parts) > 2 and video_type == "series" else None
 
     if video_type == "movie":
-        scraper_pipeline: List[Tuple[str, Any]] = [
+        scraper_pipeline = [
             ("HDFilmCehennemi", scrape_hdfilmcehennemi),
             ("FullHDFilmIzle",  scrape_fullhdfilmizle),
             ("YabanciDizi",     scrape_yabancidizi),
@@ -457,7 +410,7 @@ async def get_stream(video_type: str, imdb_id: str) -> Dict[str, Any]:
         "streams":   all_streams,
     }
 
-    # RAM Temizliği: Stremio'nun arka arkaya atacağı isteklerde RAM'in şişmesini önle
+    # Çöp toplayıcıyı zorla tetikleyerek RAM'i tamamen tahliye et
     gc.collect()
 
     return {"streams": all_streams}
