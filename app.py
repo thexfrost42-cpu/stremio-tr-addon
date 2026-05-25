@@ -11,18 +11,12 @@ from curl_cffi import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# ─────────────────────────────────────────────────────────
-# LOGLAMA
-# ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────
-# FASTAPI
-# ─────────────────────────────────────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -32,12 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────────────────
-# MANIFEST
-# ─────────────────────────────────────────────────────────
 MANIFEST = {
-    "id": "com.tr.turkce.addon.v10",
-    "version": "10.0.0",
+    "id": "com.tr.turkce.addon.v11",
+    "version": "11.0.0",
     "name": "TR Sinema Paketi 🇹🇷",
     "description": "Türkçe Dublaj & Altyazılı Film/Dizi — Dizipal, YabanciDizi, HDFilmCehennemi",
     "resources": ["stream"],
@@ -49,13 +40,9 @@ MANIFEST = {
     "behaviorHints": {"configurable": False, "adult": False},
 }
 
-# ─────────────────────────────────────────────────────────
-# DOMAIN LİSTELERİ  (baştaki çalışmazsa sıradakini dene)
-# ─────────────────────────────────────────────────────────
 DIZIPAL_DOMAINS = [
     "https://dizipal2073.com",
     "https://dizipal2066.com",
-    "https://dizipal2074.com",
     "https://dizipal1548.com",
 ]
 
@@ -71,14 +58,12 @@ HDFILM_DOMAINS = [
     "https://www.hdfilmcehennemi.net",
 ]
 
-# ─────────────────────────────────────────────────────────
-# AYARLAR
-# ─────────────────────────────────────────────────────────
-TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "15"))
+TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "25"))
 
-# ─────────────────────────────────────────────────────────
-# GLOBAL SESSION  (thread-safe)
-# ─────────────────────────────────────────────────────────
+# ScraperAPI key — render.com environment variable'dan okunur
+# Dashboard → Environment → SCRAPER_API_KEY değişkenini ekle
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
+
 _session: Optional[requests.AsyncSession] = None
 _lock: Optional[asyncio.Lock] = None
 
@@ -99,15 +84,24 @@ async def get_session() -> requests.AsyncSession:
     return _session
 
 
-# ─────────────────────────────────────────────────────────
-# YARDIMCI FONKSİYONLAR
-# ─────────────────────────────────────────────────────────
+def scraper_url(target_url: str) -> str:
+    """
+    Hedef URL'yi ScraperAPI proxy'si üzerinden geçirir.
+    ScraperAPI kendi proxy havuzunu kullanır → Türk siteler engelleyemez.
+    """
+    encoded = urllib.parse.quote(target_url, safe="")
+    return f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}&url={encoded}"
+
 
 async def fetch_html(url: str) -> Optional[str]:
-    """Verilen URL'yi çek, HTML döndür."""
+    """ScraperAPI üzerinden HTML çek."""
+    if not SCRAPER_API_KEY:
+        logger.error("SCRAPER_API_KEY tanimlanmamis!")
+        return None
     try:
         s = await get_session()
-        r = await s.get(url, timeout=TIMEOUT)
+        proxy_url = scraper_url(url)
+        r = await s.get(proxy_url, timeout=TIMEOUT)
         if r.status_code == 200:
             return r.text
         logger.warning(f"HTTP {r.status_code} → {url}")
@@ -117,7 +111,7 @@ async def fetch_html(url: str) -> Optional[str]:
 
 
 async def get_media_name(imdb_id: str, video_type: str) -> str:
-    """Cinemeta API'sinden film/dizi adını al."""
+    """Cinemeta API'sinden film/dizi adını al (proxy gerekmez)."""
     pure_id = imdb_id.split(":")[0]
     try:
         s = await get_session()
@@ -134,23 +128,13 @@ async def get_media_name(imdb_id: str, video_type: str) -> str:
 
 
 def to_slug(text: str) -> str:
-    """
-    Film/dizi adını Türk sitelerinin beklediği slug formatına çevir.
-    Örn: "Game of Thrones" → "game-of-thrones"
-         "Ölüm Treni"     → "olum-treni"
-    """
-    # Unicode normalize → ASCII'ye yaklaştır
-    text = unicodedata.normalize("NFKD", text)
-    # Türkçe karakterleri manuel değiştir
-    tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosucgiosu")
+    tr_map = str.maketrans("çğışöüÇĞİŞÖÜ", "cgisoucgisou")
     text = text.translate(tr_map)
-    # Küçük harf
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
     text = text.lower()
-    # Sadece harf, rakam, boşluk bırak
     text = re.sub(r"[^a-z0-9\s-]", "", text)
-    # Boşlukları tire yap
     text = re.sub(r"\s+", "-", text.strip())
-    # Çift tireyi tek yap
     text = re.sub(r"-+", "-", text)
     return text
 
@@ -168,10 +152,6 @@ def is_valid_src(src: str) -> bool:
 
 # ─────────────────────────────────────────────────────────
 # SCRAPER 1: DİZİPAL
-# URL yapısı:
-#   Dizi sayfası : /dizi/<slug>
-#   Bölüm sayfası: /bolum/<slug>-<s>-sezon-<e>-bolum
-#   Film sayfası : /film/<slug>-izle   VEYA  arama → /filmler/<slug>
 # ─────────────────────────────────────────────────────────
 async def scrape_dizipal(
     name: str,
@@ -187,42 +167,41 @@ async def scrape_dizipal(
     safe_name = urllib.parse.quote_plus(name)
 
     for domain in DIZIPAL_DOMAINS:
-        # Önce direkt URL dene (daha hızlı)
+        # Direkt URL dene
         if video_type == "series" and season and episode:
-            target = f"{domain}/bolum/{slug}-{season}-sezon-{episode}-bolum"
+            direct_url = f"{domain}/bolum/{slug}-{season}-sezon-{episode}-bolum"
         else:
-            target = f"{domain}/film/{slug}-izle"
+            direct_url = f"{domain}/film/{slug}-izle"
 
-        page_html = await fetch_html(target)
+        page_html = await fetch_html(direct_url)
 
-        # Direkt URL bulunamazsa arama yap
-        if not page_html or "404" in (page_html[:500] if page_html else ""):
-            search_url = f"{domain}/?s={safe_name}"
-            search_html = await fetch_html(search_url)
+        # Direkt olmadıysa arama yap
+        if not page_html:
+            search_html = await fetch_html(f"{domain}/?s={safe_name}")
             if not search_html:
                 continue
+
             soup = BeautifulSoup(search_html, "lxml")
-            # İlk sonucu al
-            pattern = r"/bolum/|/film/|/dizi/"
-            link = soup.find("a", href=re.compile(pattern))
+            link = soup.find("a", href=re.compile(r"/bolum/|/film/|/dizi/"))
             if not link:
                 continue
+
             href = link["href"]
             if not href.startswith("http"):
                 href = f"{domain}{href}"
-            # Dizi bölümüne yönlendir
+
+            # Dizi için bölüm URL'si oluştur
             if video_type == "series" and season and episode:
-                # Dizi sayfasını bul, bolum URL'si oluştur
                 href = f"{domain}/bolum/{slug}-{season}-sezon-{episode}-bolum"
+
             page_html = await fetch_html(href)
 
         if not page_html:
             continue
 
         soup = BeautifulSoup(page_html, "lxml")
-        iframes = soup.find_all("iframe")
         found = []
-        for i, iframe in enumerate(iframes):
+        for i, iframe in enumerate(soup.find_all("iframe")):
             src = iframe.get("src", "")
             if is_valid_src(src):
                 found.append({
@@ -234,17 +213,13 @@ async def scrape_dizipal(
         if found:
             streams.extend(found)
             logger.info(f"Dizipal: {len(found)} stream [{domain}]")
-            break  # Çalışan domain bulundu
+            break
 
     return streams
 
 
 # ─────────────────────────────────────────────────────────
 # SCRAPER 2: YABANCI DİZİ
-# URL yapısı:
-#   Arama       : /arama?q=<isim>
-#   Dizi sayfası: /dizi/<slug>
-#   Bölüm       : /dizi/<slug>/sezon-<s>/bolum-<e>
 # ─────────────────────────────────────────────────────────
 async def scrape_yabancidizi(
     name: str,
@@ -272,7 +247,6 @@ async def scrape_yabancidizi(
         if not href.startswith("http"):
             href = f"{domain}{href}"
 
-        # Bölüm URL'si ekle
         if video_type == "series" and season and episode:
             href = f"{href.rstrip('/')}/sezon-{season}/bolum-{episode}"
 
@@ -301,10 +275,6 @@ async def scrape_yabancidizi(
 
 # ─────────────────────────────────────────────────────────
 # SCRAPER 3: HD FİLM CEHENNEMİ
-# URL yapısı:
-#   Arama: /search/<isim>
-#   Dizi : /dizi/<slug>/<s>-sezon-<e>-bolum/  (tahmin)
-#   Film : /film/<slug>/
 # ─────────────────────────────────────────────────────────
 async def scrape_hdfilmcehennemi(
     name: str,
@@ -332,7 +302,6 @@ async def scrape_hdfilmcehennemi(
         if not href.startswith("http"):
             href = f"{domain}{href}"
 
-        # Dizi bölümüne yönlendir
         if video_type == "series" and season and episode:
             href = f"{href.rstrip('/')}/{season}-sezon-{episode}-bolum/"
 
@@ -341,29 +310,15 @@ async def scrape_hdfilmcehennemi(
             continue
 
         soup = BeautifulSoup(page_html, "lxml")
-        player_pattern = re.compile(
-            r"vidmoly|moly|player|odnoklassniki|ok\.ru|hdmoly|vk\.com"
-        )
         found = []
         for i, iframe in enumerate(soup.find_all("iframe")):
             src = iframe.get("src", "")
-            if is_valid_src(src) and player_pattern.search(src):
+            if is_valid_src(src):
                 found.append({
                     "name": "TR Addon 🇹🇷",
                     "title": f"HDFilmCehennemi #{i+1} 🔥",
                     "externalUrl": fix_src(src),
                 })
-
-        # Hiç iframe bulunamazsa tüm iframe'leri dene
-        if not found:
-            for i, iframe in enumerate(soup.find_all("iframe")):
-                src = iframe.get("src", "")
-                if is_valid_src(src):
-                    found.append({
-                        "name": "TR Addon 🇹🇷",
-                        "title": f"HDFilmCehennemi #{i+1} 🔥",
-                        "externalUrl": fix_src(src),
-                    })
 
         if found:
             streams.extend(found)
@@ -380,6 +335,10 @@ async def scrape_hdfilmcehennemi(
 @app.on_event("startup")
 async def startup_event():
     await get_session()
+    if not SCRAPER_API_KEY:
+        logger.warning("SCRAPER_API_KEY tanimlanmamis! Render Environment Variables'a ekle.")
+    else:
+        logger.info(f"ScraperAPI aktif. Key: {SCRAPER_API_KEY[:8]}...")
     logger.info("=== TR Sinema Paketi baslatildi ===")
 
 
@@ -389,7 +348,7 @@ def health_check():
         "status": "ok",
         "addon": MANIFEST["name"],
         "version": MANIFEST["version"],
-        "sources": ["Dizipal", "YabanciDizi", "HDFilmCehennemi"],
+        "scraper_api": "aktif" if SCRAPER_API_KEY else "TANIMLANMAMIS",
     }
 
 
@@ -404,9 +363,7 @@ async def get_stream(video_type: str, imdb_id: str):
     season = parts[1] if len(parts) > 1 and video_type == "series" else None
     episode = parts[2] if len(parts) > 2 and video_type == "series" else None
 
-    logger.info(
-        f"Istek → type={video_type} id={imdb_id} s={season} e={episode}"
-    )
+    logger.info(f"Istek → type={video_type} id={imdb_id} s={season} e={episode}")
 
     all_streams: List[dict] = []
 
