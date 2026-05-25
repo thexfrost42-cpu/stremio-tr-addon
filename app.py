@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ─── Manifest ─────────────────────────────────────────────────────────────────
 MANIFEST = {
     "id": "com.tr.turkce.addon.v12",
-    "version": "12.0.0",
+    "version": "1.12.4",
     "name": "TR Sinema Paketi 🇹🇷",
     "description": "Türkçe Dublaj Film & Dizi — Dizipal, YabanciDizi, HDFilmCehennemi, FullHDFilmIzle",
     "resources": ["stream"],
