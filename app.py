@@ -60,7 +60,7 @@ FULLHDFILM_DOMAINS = [
 ]
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "20"))
+TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "10"))
 
 # ─── scrape.do Token Rotasyonu ────────────────────────────────────────────────
 # Render Environment'a SCRAPE_DO_TOKEN_1 ... SCRAPE_DO_TOKEN_4 ekle
@@ -335,6 +335,9 @@ async def scrape_dizipal(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCRAPER 2 – YABANCI DİZİ
+# URL pattern:
+#   Dizi  → {domain}/dizi/{slug}/sezon-{s}/bolum-{e}/
+#   Film  → {domain}/film/{slug}/
 # ─────────────────────────────────────────────────────────────────────────────
 async def scrape_yabancidizi(
     name: str,
@@ -342,30 +345,43 @@ async def scrape_yabancidizi(
     season: Optional[str],
     episode: Optional[str],
 ) -> List[dict]:
-    """Arama (1 istek) + içerik sayfası (1 istek). İlk çalışan domain'de durur."""
+    """Direkt URL dener (1 istek). Bulamazsa arama yapar (+1 istek)."""
     if not name:
         return []
 
+    slug = to_slug(name)
     safe_name = urllib.parse.quote_plus(name)
 
     for domain in YABANCIDIZI_DOMAINS:
-        search_html = await fetch_html(f"{domain}/?s={safe_name}")
-        if not search_html:
-            continue
-
-        soup_s = BeautifulSoup(search_html, "lxml")
-        link = soup_s.find("a", href=re.compile(r"/(dizi|film)/"))
-        if not link:
-            continue
-
-        href: str = link["href"]
-        if not href.startswith("http"):
-            href = f"{domain}{href}"
-
+        # ── Adım 1: Direkt URL dene ──────────────────────────────────────────
         if video_type == "series" and season and episode:
-            href = f"{href.rstrip('/')}/sezon-{season}/bolum-{episode}/"
+            direct_url = f"{domain}/dizi/{slug}/sezon-{season}/bolum-{episode}/"
+        else:
+            direct_url = f"{domain}/film/{slug}/"
 
-        page_html = await fetch_html(href)
+        page_html = await fetch_html(direct_url)
+
+        # ── Adım 2: Direkt URL başarısız → arama yap ─────────────────────────
+        if not page_html:
+            search_html = await fetch_html(f"{domain}/?s={safe_name}")
+            if not search_html:
+                continue
+
+            soup_s = BeautifulSoup(search_html, "lxml")
+            link = soup_s.find("a", href=re.compile(r"/(dizi|film)/"))
+            if not link:
+                continue
+
+            href: str = link["href"]
+            if not href.startswith("http"):
+                href = f"{domain}{href}"
+
+            if video_type == "series" and season and episode:
+                base = re.sub(r"/sezon-\d+.*", "", href.rstrip("/"))
+                href = f"{base}/sezon-{season}/bolum-{episode}/"
+
+            page_html = await fetch_html(href)
+
         if not page_html:
             continue
 
@@ -388,6 +404,9 @@ async def scrape_yabancidizi(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCRAPER 3 – HD FİLM CEHENNEMİ
+# URL pattern:
+#   Dizi  → {domain}/dizi/{slug}/sezon-{s}/bolum-{e}/
+#   Film  → {domain}/film/{slug}-izle/  veya  {domain}/film/{slug}/
 # ─────────────────────────────────────────────────────────────────────────────
 async def scrape_hdfilmcehennemi(
     name: str,
@@ -395,30 +414,48 @@ async def scrape_hdfilmcehennemi(
     season: Optional[str],
     episode: Optional[str],
 ) -> List[dict]:
-    """Arama (1 istek) + içerik sayfası (1 istek). İlk çalışan domain'de durur."""
+    """Direkt URL dener (1 istek). Bulamazsa arama yapar (+1 istek)."""
     if not name:
         return []
 
+    slug = to_slug(name)
     safe_name = urllib.parse.quote_plus(name)
 
     for domain in HDFILM_DOMAINS:
-        search_html = await fetch_html(f"{domain}/?s={safe_name}")
-        if not search_html:
-            continue
-
-        soup_s = BeautifulSoup(search_html, "lxml")
-        link = soup_s.find("a", href=re.compile(r"/(film|dizi)/"))
-        if not link:
-            continue
-
-        href: str = link["href"]
-        if not href.startswith("http"):
-            href = f"{domain}{href}"
-
+        # ── Adım 1: Direkt URL dene ──────────────────────────────────────────
         if video_type == "series" and season and episode:
-            href = f"{href.rstrip('/')}/{season}-sezon-{episode}-bolum/"
+            direct_url = f"{domain}/dizi/{slug}/sezon-{season}/bolum-{episode}/"
+        else:
+            direct_url = f"{domain}/film/{slug}-izle/"
 
-        page_html = await fetch_html(href)
+        page_html = await fetch_html(direct_url)
+
+        # Filmler için alternatif URL deseni
+        if not page_html and video_type == "movie":
+            page_html = await fetch_html(f"{domain}/film/{slug}/")
+
+        # ── Adım 2: Direkt URL başarısız → arama yap ─────────────────────────
+        if not page_html:
+            search_html = await fetch_html(f"{domain}/?s={safe_name}")
+            if not search_html:
+                continue
+
+            soup_s = BeautifulSoup(search_html, "lxml")
+            link = soup_s.find("a", href=re.compile(r"/(film|dizi)/"))
+            if not link:
+                continue
+
+            href: str = link["href"]
+            if not href.startswith("http"):
+                href = f"{domain}{href}"
+
+            # Dizi için direkt bölüm URL'sini kur
+            if video_type == "series" and season and episode:
+                base = re.sub(r"/sezon-\d+.*", "", href.rstrip("/"))
+                href = f"{base}/sezon-{season}/bolum-{episode}/"
+
+            page_html = await fetch_html(href)
+
         if not page_html:
             continue
 
@@ -441,6 +478,9 @@ async def scrape_hdfilmcehennemi(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCRAPER 4 – FULLHD FİLM İZLE
+# URL pattern:
+#   Film  → {domain}/{slug}-izle/
+#   Dizi  → {domain}/dizi/{slug}/sezon-{s}-bolum-{e}/
 # ─────────────────────────────────────────────────────────────────────────────
 async def scrape_fullhdfilmizle(
     name: str,
@@ -448,30 +488,42 @@ async def scrape_fullhdfilmizle(
     season: Optional[str],
     episode: Optional[str],
 ) -> List[dict]:
-    """Arama (1 istek) + içerik sayfası (1 istek). İlk çalışan domain'de durur."""
+    """Direkt URL dener (1 istek). Bulamazsa arama yapar (+1 istek)."""
     if not name:
         return []
 
+    slug = to_slug(name)
     safe_name = urllib.parse.quote_plus(name)
 
     for domain in FULLHDFILM_DOMAINS:
-        search_html = await fetch_html(f"{domain}/?s={safe_name}")
-        if not search_html:
-            continue
-
-        soup_s = BeautifulSoup(search_html, "lxml")
-        link = soup_s.find("a", href=re.compile(r"/(film|dizi)/"))
-        if not link:
-            continue
-
-        href: str = link["href"]
-        if not href.startswith("http"):
-            href = f"{domain}{href}"
-
+        # ── Adım 1: Direkt URL dene ──────────────────────────────────────────
         if video_type == "series" and season and episode:
-            href = f"{href.rstrip('/')}/sezon-{season}/bolum-{episode}/"
+            direct_url = f"{domain}/dizi/{slug}/sezon-{season}-bolum-{episode}/"
+        else:
+            direct_url = f"{domain}/{slug}-izle/"
 
-        page_html = await fetch_html(href)
+        page_html = await fetch_html(direct_url)
+
+        # ── Adım 2: Direkt URL başarısız → arama yap ─────────────────────────
+        if not page_html:
+            search_html = await fetch_html(f"{domain}/?s={safe_name}")
+            if not search_html:
+                continue
+
+            soup_s = BeautifulSoup(search_html, "lxml")
+            link = soup_s.find("a", href=re.compile(r"/(film|dizi|[a-z0-9-]+-izle)/"))
+            if not link:
+                continue
+
+            href: str = link["href"]
+            if not href.startswith("http"):
+                href = f"{domain}{href}"
+
+            if video_type == "series" and season and episode:
+                href = f"{href.rstrip('/')}/sezon-{season}-bolum-{episode}/"
+
+            page_html = await fetch_html(href)
+
         if not page_html:
             continue
 
