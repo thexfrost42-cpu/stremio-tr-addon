@@ -63,13 +63,13 @@ FULLHDFILM_DOMAINS = [
 TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "10"))
 
 # ─── scrape.do Token Rotasyonu ────────────────────────────────────────────────
-# Render Environment'a SCRAPE_DO_TOKEN_1 ... SCRAPE_DO_TOKEN_4 ekle
+# Render'a SCRAPE_DO_TOKEN_1 ... SCRAPE_DO_TOKEN_4 ekle
 SCRAPER_API_KEYS: List[str] = [
     k for k in [
-        os.getenv("SCRAPE_DO_TOKEN_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
-        os.getenv("SCRAPE_DO_TOKEN_2", "ad94f3583fe44d0ca3635c5af37b73f2c64d90c0a59"),
-        os.getenv("SCRAPE_DO_TOKEN_3", "c1cb4ed6152049b48307d7e570a485ef66ae1e3b703"),
-        os.getenv("SCRAPE_DO_TOKEN_4", "14d6807a8de34c12840670630573ea6596f9036f277"),
+        os.getenv("SCRAPE_DO_TOKEN_1", ""),
+        os.getenv("SCRAPE_DO_TOKEN_2", ""),
+        os.getenv("SCRAPE_DO_TOKEN_3", ""),
+        os.getenv("SCRAPE_DO_TOKEN_4", ""),
     ]
     if k
 ]
@@ -86,7 +86,6 @@ def _get_key_lock() -> asyncio.Lock:
 
 
 def _current_key() -> str:
-    """Anlık aktif key'i döndürür (lock gerekmez, okuma atomik)."""
     return SCRAPER_API_KEYS[_key_index] if SCRAPER_API_KEYS else ""
 
 
@@ -94,7 +93,7 @@ async def _rotate_key() -> None:
     global _key_index
     async with _get_key_lock():
         _key_index = (_key_index + 1) % len(SCRAPER_API_KEYS)
-    logger.warning(f"Key rotasyonu: {_key_index + 1}. key'e geçildi.")
+    logger.warning(f"Token rotasyonu: {_key_index + 1}. token'a geçildi.")
 
 
 # ─── HTTP Session ─────────────────────────────────────────────────────────────
@@ -120,11 +119,7 @@ async def get_session() -> requests.AsyncSession:
 
 # ─── Fetch ────────────────────────────────────────────────────────────────────
 async def fetch_html(url: str) -> Optional[str]:
-    """
-    Hedef URL'yi scrape.do proxy'si üzerinden çeker.
-    Format: https://api.scrape.do?token=TOKEN&url=ENCODED_URL
-    429/403 alınca bir kez token rotasyonu yaparak tekrar dener.
-    """
+    """scrape.do üzerinden HTML çeker. 429/403'te token rotasyonu yapar."""
     if not SCRAPER_API_KEYS:
         logger.error("Hiç SCRAPE_DO_TOKEN tanımlanmamış!")
         return None
@@ -146,7 +141,7 @@ async def fetch_html(url: str) -> Optional[str]:
             return r.text
 
         if r.status_code in (429, 403):
-            logger.warning(f"HTTP {r.status_code} rate-limit (attempt {attempt + 1}) → token rotasyonu")
+            logger.warning(f"HTTP {r.status_code} (attempt {attempt + 1}) → token rotasyonu")
             await _rotate_key()
             continue
 
@@ -158,7 +153,7 @@ async def fetch_html(url: str) -> Optional[str]:
 
 # ─── Cinemeta ─────────────────────────────────────────────────────────────────
 async def get_media_name(imdb_id: str, video_type: str) -> str:
-    """Cinemeta API'sinden film/dizi adını çeker. Proxy gerekmez."""
+    """Cinemeta'dan film/dizi adını çeker. Proxy kullanmaz."""
     pure_id = imdb_id.split(":")[0]
     try:
         s = await get_session()
@@ -176,7 +171,7 @@ async def get_media_name(imdb_id: str, video_type: str) -> str:
 
 # ─── Yardımcı Fonksiyonlar ────────────────────────────────────────────────────
 def to_slug(text: str) -> str:
-    """Metni URL-dostu slug formatına dönüştürür (TR karakter desteğiyle)."""
+    """Metni URL-dostu slug'a dönüştürür (TR karakter desteği)."""
     tr_map = str.maketrans("çğışöüÇĞİŞÖÜ", "cgisoucgisou")
     text = text.translate(tr_map)
     text = unicodedata.normalize("NFKD", text)
@@ -189,7 +184,6 @@ def to_slug(text: str) -> str:
 
 
 def fix_src(src: str) -> str:
-    """Protocol-relative URL'leri tam HTTPS URL'ye dönüştürür."""
     src = src.strip()
     if src.startswith("//"):
         return "https:" + src
@@ -202,28 +196,19 @@ def is_valid_src(src: str) -> bool:
 
 def extract_dublaj_iframes(soup: BeautifulSoup) -> List[str]:
     """
-    HTML'den Türkçe Dublaj iframe src'lerini çıkarır.
-
-    Öncelik sırası:
-      1. id veya class'ında 'dublaj' geçen kapsayıcılardaki iframe'ler
-      2. 'türkçe dublaj' / 'turkce dublaj' metin etiketine yakın iframe'ler
-      3. (Fallback) Sayfadaki tüm geçerli iframe'ler
-
-    Fallback aktifleşirse akışlar yine "Türkçe Dublaj" etiketiyle döner
-    çünkü scraping yapılan siteler zaten Türkçe içerik sunan platformlardır.
+    Sayfadan Türkçe Dublaj iframe src'lerini çıkarır.
+    Öncelik: dublaj container > dublaj metin yakını > tüm iframe'ler (fallback)
     """
     seen: set = set()
     iframes: List[str] = []
 
-    def add(src: str) -> bool:
+    def add(src: str) -> None:
         fsrc = fix_src(src)
         if fsrc not in seen:
             seen.add(fsrc)
             iframes.append(fsrc)
-            return True
-        return False
 
-    # ── Strateji 1: id/class içinde 'dublaj' geçen container ──────────────────
+    # Strateji 1: id veya class'ında 'dublaj' geçen kapsayıcılar
     containers = (
         soup.find_all(True, attrs={"id": re.compile(r"dublaj", re.I)})
         + soup.find_all(True, attrs={"class": re.compile(r"dublaj", re.I)})
@@ -237,10 +222,10 @@ def extract_dublaj_iframes(soup: BeautifulSoup) -> List[str]:
     if iframes:
         return iframes
 
-    # ── Strateji 2: "türkçe dublaj" metin düğümüne yakın iframe ──────────────
+    # Strateji 2: "türkçe dublaj" metni yakınındaki iframe'ler
     for text_node in soup.find_all(string=re.compile(r"t[uü]rk[cç]e\s*dublaj", re.I)):
         parent = text_node.parent
-        for _ in range(7):  # en fazla 7 seviye yukarı çık
+        for _ in range(7):
             if parent is None:
                 break
             for iframe in parent.find_all("iframe"):
@@ -254,7 +239,7 @@ def extract_dublaj_iframes(soup: BeautifulSoup) -> List[str]:
     if iframes:
         return iframes
 
-    # ── Strateji 3 (Fallback): tüm iframe'ler ────────────────────────────────
+    # Strateji 3 (fallback): tüm iframe'ler
     for iframe in soup.find_all("iframe"):
         src = iframe.get("src", "")
         if is_valid_src(src):
@@ -280,12 +265,11 @@ async def scrape_dizipal(
     slug = to_slug(name)
 
     for domain in DIZIPAL_DOMAINS:
-        # Tipe göre tek bir direkt URL kur, karıştırma
         if video_type == "series":
             if not (season and episode):
                 return []
             url = f"{domain}/bolum/{slug}-{season}-sezon-{episode}-bolum/"
-        else:  # movie
+        else:
             url = f"{domain}/film/{slug}-izle/"
 
         page_html = await fetch_html(url)
@@ -310,7 +294,7 @@ async def scrape_dizipal(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCRAPER 2 – YABANCI DİZİ  (sadece dizi)
+# SCRAPER 2 – YABANCI DİZİ  (yalnızca dizi)
 # Dizi : {domain}/dizi/{slug}/sezon-{season}/bolum-{episode}/
 # ─────────────────────────────────────────────────────────────────────────────
 async def scrape_yabancidizi(
@@ -319,7 +303,6 @@ async def scrape_yabancidizi(
     season: Optional[str],
     episode: Optional[str],
 ) -> List[dict]:
-    # Bu site sadece dizi içeriği sunar
     if video_type != "series" or not name or not season or not episode:
         return []
 
@@ -365,12 +348,11 @@ async def scrape_hdfilmcehennemi(
     slug = to_slug(name)
 
     for domain in HDFILM_DOMAINS:
-        # Tipe göre tek bir direkt URL kur, karıştırma
         if video_type == "series":
             if not (season and episode):
                 return []
             url = f"{domain}/dizi/{slug}/sezon-{season}/bolum-{episode}/"
-        else:  # movie
+        else:
             url = f"{domain}/film/{slug}-izle/"
 
         page_html = await fetch_html(url)
@@ -395,7 +377,7 @@ async def scrape_hdfilmcehennemi(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCRAPER 4 – FULLHD FİLM İZLE  (sadece film)
+# SCRAPER 4 – FULLHD FİLM İZLE  (yalnızca film)
 # Film : {domain}/{slug}-izle/
 # ─────────────────────────────────────────────────────────────────────────────
 async def scrape_fullhdfilmizle(
@@ -404,7 +386,6 @@ async def scrape_fullhdfilmizle(
     season: Optional[str],
     episode: Optional[str],
 ) -> List[dict]:
-    # Bu site sadece film içeriği sunar
     if video_type != "movie" or not name:
         return []
 
@@ -432,40 +413,19 @@ async def scrape_fullhdfilmizle(
 
     return []
 
-        if not page_html:
-            continue
-
-        soup = BeautifulSoup(page_html, "lxml")
-        srcs = extract_dublaj_iframes(soup)
-        if srcs:
-            streams = [
-                {
-                    "name": "TR Addon 🇹🇷",
-                    "title": f"FullHDFilm #{i + 1} ⚡\n🇹🇷 Türkçe Dublaj",
-                    "externalUrl": src,
-                }
-                for i, src in enumerate(srcs)
-            ]
-            logger.info(f"FullHDFilmIzle: {len(streams)} stream [{domain}]")
-            return streams
-
-    return []
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # APP LIFECYCLE & ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
-    # Startup
     await get_session()
     if not SCRAPER_API_KEYS:
-        logger.warning("Hiç SCRAPE_DO_TOKEN tanımlanmamış! Render env değişkenlerini kontrol et.")
+        logger.warning("Hiç SCRAPE_DO_TOKEN tanımlanmamış!")
     else:
         logger.info(f"scrape.do aktif. {len(SCRAPER_API_KEYS)} token yüklendi.")
     logger.info("=== TR Sinema Paketi başlatıldı ===")
     yield
-    # Shutdown (temizlik gerekmez)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -501,16 +461,12 @@ def get_manifest():
 @app.get("/stream/{video_type}/{imdb_id}.json")
 async def get_stream(video_type: str, imdb_id: str):
     """
-    Stremio stream endpoint.
-
     imdb_id formatı:
-      Film  : tt1234567
-      Dizi  : tt1234567:1:2  → sezon=1, bölüm=2
+      Film : tt1234567
+      Dizi : tt1234567:1:2  (id:sezon:bolum)
 
-    Scraper'lar sırayla çalışır. İlk sonuç döner, diğerleri çağrılmaz.
-
-    Film  pipeline: HDFilmCehennemi → FullHDFilmIzle → Dizipal
-    Dizi  pipeline: HDFilmCehennemi → Dizipal → YabanciDizi
+    Pipeline — Film : HDFilmCehennemi → FullHDFilmIzle → Dizipal
+    Pipeline — Dizi : HDFilmCehennemi → Dizipal → YabanciDizi
     """
     parts = imdb_id.split(":")
     season: Optional[str] = parts[1] if len(parts) > 1 and video_type == "series" else None
@@ -522,14 +478,12 @@ async def get_stream(video_type: str, imdb_id: str):
         name = await get_media_name(imdb_id, video_type)
 
         if video_type == "movie":
-            # YabanciDizi sadece dizi → pipeline'a dahil değil
             pipeline = [
                 ("HDFilmCehennemi", scrape_hdfilmcehennemi),
                 ("FullHDFilmIzle",  scrape_fullhdfilmizle),
                 ("Dizipal",         scrape_dizipal),
             ]
-        else:  # series
-            # FullHDFilmIzle sadece film → pipeline'a dahil değil
+        else:
             pipeline = [
                 ("HDFilmCehennemi", scrape_hdfilmcehennemi),
                 ("Dizipal",         scrape_dizipal),
