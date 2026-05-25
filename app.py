@@ -66,7 +66,7 @@ TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "10"))
 # Render'a SCRAPE_DO_TOKEN_1 ... SCRAPE_DO_TOKEN_4 ekle
 SCRAPER_API_KEYS: List[str] = [
     k for k in [
-        os.getenv("SCRAPE_DO_TOKEN_1", ""),
+        os.getenv("SCRAPE_DO_TOKEN_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
         os.getenv("SCRAPE_DO_TOKEN_2", ""),
         os.getenv("SCRAPE_DO_TOKEN_3", ""),
         os.getenv("SCRAPE_DO_TOKEN_4", ""),
