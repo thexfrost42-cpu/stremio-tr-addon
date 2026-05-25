@@ -1,9 +1,17 @@
 services:
   - type: web
-    name: tr-sinema-paketi
+    name: stremio-tr-addon
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: SCRAPEDO_KEY_1
+        sync: false
+      - key: SCRAPEDO_KEY_2
+        sync: false
+      - key: SCRAPEDO_KEY_3
+        sync: false
+      - key: SCRAPEDO_KEY_4
+        sync: false
       - key: SCRAPE_TIMEOUT
-        value: "15"
+        value: "25"
