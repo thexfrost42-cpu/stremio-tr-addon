@@ -62,14 +62,14 @@ FULLHDFILM_DOMAINS = [
 # ─── Config ───────────────────────────────────────────────────────────────────
 TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "20"))
 
-# ─── ScraperAPI Key Rotasyonu ─────────────────────────────────────────────────
-# Render Environment'a SCRAPER_API_KEY_1 ... SCRAPER_API_KEY_4 ekle
+# ─── scrape.do Token Rotasyonu ────────────────────────────────────────────────
+# Render Environment'a SCRAPE_DO_TOKEN_1 ... SCRAPE_DO_TOKEN_4 ekle
 SCRAPER_API_KEYS: List[str] = [
     k for k in [
-        os.getenv("SCRAPER_API_KEY_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
-        os.getenv("SCRAPER_API_KEY_2", "ad94f3583fe44d0ca3635c5af37b73f2c64d90c0a59"),
-        os.getenv("SCRAPER_API_KEY_3", "c1cb4ed6152049b48307d7e570a485ef66ae1e3b703"),
-        os.getenv("SCRAPER_API_KEY_4", "14d6807a8de34c12840670630573ea6596f9036f277"),
+        os.getenv("SCRAPE_DO_TOKEN_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
+        os.getenv("SCRAPE_DO_TOKEN_2", "ad94f3583fe44d0ca3635c5af37b73f2c64d90c0a59"),
+        os.getenv("SCRAPE_DO_TOKEN_3", "c1cb4ed6152049b48307d7e570a485ef66ae1e3b703"),
+        os.getenv("SCRAPE_DO_TOKEN_4", "14d6807a8de34c12840670630573ea6596f9036f277"),
     ]
     if k
 ]
@@ -121,22 +121,21 @@ async def get_session() -> requests.AsyncSession:
 # ─── Fetch ────────────────────────────────────────────────────────────────────
 async def fetch_html(url: str) -> Optional[str]:
     """
-    Hedef URL'yi ScraperAPI proxy'si üzerinden çeker.
-    429 alınca bir kez key rotasyonu yaparak tekrar dener.
-    Her başarılı olmayan domain'de None döner; çağıran bir sonraki domain'e geçer.
+    Hedef URL'yi scrape.do proxy'si üzerinden çeker.
+    Format: https://api.scrape.do?token=TOKEN&url=ENCODED_URL
+    429/403 alınca bir kez token rotasyonu yaparak tekrar dener.
     """
     if not SCRAPER_API_KEYS:
-        logger.error("Hiç SCRAPER_API_KEY tanımlanmamış!")
+        logger.error("Hiç SCRAPE_DO_TOKEN tanımlanmamış!")
         return None
 
     s = await get_session()
     encoded = urllib.parse.quote(url, safe="")
 
-    # En fazla 2 deneme: ilk → mevcut key, ikinci → rotate sonrası
     max_attempts = min(2, len(SCRAPER_API_KEYS))
     for attempt in range(max_attempts):
-        key = _current_key()
-        proxy_url = f"https://api.scraperapi.com/?api_key={key}&url={encoded}"
+        token = _current_key()
+        proxy_url = f"https://api.scrape.do?token={token}&url={encoded}"
         try:
             r = await s.get(proxy_url, timeout=TIMEOUT)
         except Exception as e:
@@ -146,8 +145,8 @@ async def fetch_html(url: str) -> Optional[str]:
         if r.status_code == 200:
             return r.text
 
-        if r.status_code == 429:
-            logger.warning(f"429 rate-limit (attempt {attempt + 1}) → key rotasyonu")
+        if r.status_code in (429, 403):
+            logger.warning(f"HTTP {r.status_code} rate-limit (attempt {attempt + 1}) → token rotasyonu")
             await _rotate_key()
             continue
 
@@ -501,9 +500,9 @@ async def lifespan(fastapi_app: FastAPI):
     # Startup
     await get_session()
     if not SCRAPER_API_KEYS:
-        logger.warning("Hiç SCRAPER_API_KEY tanımlanmamış! Render env değişkenlerini kontrol et.")
+        logger.warning("Hiç SCRAPE_DO_TOKEN tanımlanmamış! Render env değişkenlerini kontrol et.")
     else:
-        logger.info(f"ScraperAPI aktif. {len(SCRAPER_API_KEYS)} key yüklendi.")
+        logger.info(f"scrape.do aktif. {len(SCRAPER_API_KEYS)} token yüklendi.")
     logger.info("=== TR Sinema Paketi başlatıldı ===")
     yield
     # Shutdown (temizlik gerekmez)
@@ -526,8 +525,8 @@ def health_check():
         "status": "ok",
         "addon": MANIFEST["name"],
         "version": MANIFEST["version"],
-        "scraper_api": (
-            f"{len(SCRAPER_API_KEYS)} key aktif"
+        "scrape_do": (
+            f"{len(SCRAPER_API_KEYS)} token aktif"
             if SCRAPER_API_KEYS
             else "TANIMLANMAMIŞ"
         ),
