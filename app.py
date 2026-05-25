@@ -28,9 +28,9 @@ app.add_middleware(
 
 MANIFEST = {
     "id": "com.tr.turkce.addon.v12",
-    "version": "12.5.0",
+    "version": "12.6.0",
     "name": "TR Sinema Paketi 🇹🇷",
-    "description": "Kendi Kendini Onaran Dinamik Domain & Akıllı Player Motorlu Addon",
+    "description": "Render Uyumlu Lazy-Domain & Sabit Kaynak Sıralı Film/Dizi Sağlayıcısı",
     "resources": ["stream"],
     "types": ["movie", "series"],
     "idPrefixes": ["tt"],
@@ -40,23 +40,22 @@ MANIFEST = {
     "behaviorHints": {"configurable": False, "adult": False},
 }
 
-# Sürekli değişen domainleri otomatik yakalamak için ana köprüler
+# Ana yönlendiriciler çökerse veya yavaş kalırsa anında devreye girecek statik yedek havuzu
 RESOLVER_MAP = {
-    "hdfilmcehennemi": "https://www.hdfilmcehennemi.com",
-    "fullhdfilmizle": "https://www.fullhdfilmizlesene.com",
-    "dizipal": "https://dizipal.com", 
-    "yabancidizi": "https://yabancidizi.org"
+    "hdfilmcehennemi": "https://www.hdfilmcehennemi.nl",
+    "fullhdfilmizle": "https://www.fullhdfilmizlesene.de",
+    "dizipal": "https://dizipal2073.com", 
+    "yabancidizi": "https://yabancidizi.life"
 }
 
-# Google Fallback için yedek arama kelimeleri
 FALLBACK_SEARCH_KEYWORDS = {
     "hdfilmcehennemi": "hdfilmcehennemi güncel adresi",
-    "fullhdfilmizle": "fullhdfilmizlesene güncel",
+    "fullhdfilmizle": "fullhdfilmizlesene güncel adresi",
     "dizipal": "dizipal güncel adresi",
-    "yabancidizi": "yabancidizi güncel giriş"
+    "yabancidizi": "yabancidizi güncel adresi"
 }
 
-# Canlı domain hafızası (Cache)
+# Hafıza başlangıçta boş, ilk aramayla birlikte dolacak (Lazy-load cache)
 LIVE_DOMAINS = {
     "hdfilmcehennemi": "",
     "fullhdfilmizle": "",
@@ -64,12 +63,11 @@ LIVE_DOMAINS = {
     "yabancidizi": ""
 }
 
-HTTP_TIMEOUT = 8
+HTTP_TIMEOUT = 7  # Stremio'nun kopmaması için istek başına timeout süresini 7 saniyeye çektik
 
-# scrape.do 4'lü Token Yönetimi ve Rotasyon Kilidi
 _RAW_TOKENS = [
     os.getenv("SCRAPEDO_KEY_1", "a07f9a13f00041c28a4d8f51b201a1e93f1a78a9fea"),
-    os.getenv("SCRAPEDO_KEY_2", "ad94f3583fe44d0ca3635c5af37b73f2c64d90c0a59"),
+    os.getenv("SCRAPEDO_KEY_2", ""),
     os.getenv("SCRAPEDO_KEY_3", ""),
     os.getenv("SCRAPEDO_KEY_4", ""),
 ]
@@ -110,7 +108,6 @@ async def get_session() -> requests.AsyncSession:
     async with _get_lock():
         if _session is None:
             _session = requests.AsyncSession(impersonate="chrome120")
-            logger.info("AsyncSession başarıyla başlatıldı.")
     return _session
 
 async def fetch_html(url: str) -> Optional[str]:
@@ -137,14 +134,14 @@ async def fetch_html(url: str) -> Optional[str]:
     return None
 
 # ─────────────────────────────────────────────────────────
-# AKILLI DOMAİN ÇÖZÜCÜ & GÜVENLİK DUVARI (SELF-HEALING)
+# LAZY-DOMAİN RESOLVER MOTORU
 # ─────────────────────────────────────────────────────────
 
 async def resolve_via_google(site_key: str) -> Optional[str]:
     keyword = FALLBACK_SEARCH_KEYWORDS.get(site_key)
     if not keyword: return None
     
-    logger.info(f"🔍 [Google Fallback] {site_key} için Google taranıyor...")
+    logger.info(f"🔍 [Google Fallback] {site_key} aranıyor...")
     google_url = f"https://www.google.com/search?q={urllib.parse.quote(keyword)}&num=3"
     
     html = await fetch_html(google_url)
@@ -160,14 +157,12 @@ async def resolve_via_google(site_key: str) -> Optional[str]:
                 if "google" not in actual_url and any(x in actual_url for x in [site_key, "dizipal"]):
                     parsed_domain = urllib.parse.urlparse(actual_url)
                     resolved = f"{parsed_domain.scheme}://{parsed_domain.netloc}"
-                    logger.info(f"🟢 [Google Fallback Başarılı] {site_key} Yeni Adresi: {resolved}")
                     return resolved
     return None
 
 async def update_live_domain(site_key: str) -> str:
+    """ Sadece ihtiyaç anında çağrılır ve Render'ı asla kilitlemez. """
     base_url = RESOLVER_MAP.get(site_key)
-    if not base_url: return ""
-    
     token = await get_active_token()
     if not token: return base_url
 
@@ -176,36 +171,32 @@ async def update_live_domain(site_key: str) -> str:
     
     try:
         s = await get_session()
-        r = await s.get(proxy_url, timeout=10, allow_redirects=True)
-        
-        # 1. Aşama: Header kontrolü
+        r = await s.get(proxy_url, timeout=5, allow_redirects=True)
         final_url = r.headers.get("X-Final-Url") or r.headers.get("sc-final-url") or r.url
         
-        # 2. Aşama (Debug Fix): Eğer proxy yönlendirmeyi gizlediyse HTML içindeki canonical/meta etiketlerinden çöz
         if not final_url or "scrape.do" in final_url:
             soup = BeautifulSoup(r.text, "lxml")
             canonical = soup.find("link", rel="canonical")
             if canonical and canonical.get("href"):
                 final_url = canonical["href"]
-            else:
-                og_url = soup.find("meta", property="og:url")
-                if og_url and og_url.get("content"):
-                    final_url = og_url["content"]
 
         if final_url and "scrape.do" not in final_url and len(final_url) > 10:
             parsed = urllib.parse.urlparse(final_url)
             resolved_domain = f"{parsed.scheme}://{parsed.netloc}"
             LIVE_DOMAINS[site_key] = resolved_domain
-            logger.info(f"🎯 Canlı Domain Tespit Edildi [{site_key}] ➔ {resolved_domain}")
+            logger.info(f"🎯 Canlı Domain Çözüldü [{site_key}] ➔ {resolved_domain}")
             return resolved_domain
     except Exception:
-        logger.warning(f"⚠️ {site_key} ana köprüsü yanıt vermedi. Yedek Google tarayıcı başlatılıyor...")
+        pass
     
+    # Ana resolver yanıt vermezse arka planda hızlıca Google Fallback dene
     fallback_domain = await resolve_via_google(site_key)
     if fallback_domain:
         LIVE_DOMAINS[site_key] = fallback_domain
         return fallback_domain
 
+    # İkisi de o anki koruma duvarına takılırsa havuzdaki güvenli statik linki dön
+    LIVE_DOMAINS[site_key] = base_url
     return base_url
 
 async def get_domain(site_key: str) -> str:
@@ -214,7 +205,7 @@ async def get_domain(site_key: str) -> str:
     return LIVE_DOMAINS[site_key]
 
 # ─────────────────────────────────────────────────────────
-# METADATA & YARDIMCI MOTORLAR
+# UTILS & SEARCH ENGINE
 # ─────────────────────────────────────────────────────────
 
 async def get_media_name(imdb_id: str, video_type: str) -> str:
@@ -222,7 +213,7 @@ async def get_media_name(imdb_id: str, video_type: str) -> str:
     try:
         s = await get_session()
         url = f"https://v3-cinemeta.strem.io/meta/{video_type}/{pure_id}.json"
-        r = await s.get(url, timeout=5)
+        r = await s.get(url, timeout=4)
         if r.status_code == 200:
             name = r.json().get("meta", {}).get("name", "")
             if name: return name
@@ -243,7 +234,6 @@ def to_slug(text: str) -> str:
     return text
 
 def detect_player_provider(url: str) -> str:
-    """ Improvise: İframe linkinden hangi yayın sağlayıcı olduğunu çözer """
     u = url.lower()
     if "vidmoly" in u: return "Vidmoly 🟣"
     if "fembed" in u or "feurl" in u: return "Fembed 🟠"
@@ -260,7 +250,6 @@ def extract_iframes(soup: BeautifulSoup, source_name: str, emoji: str) -> List[D
     for iframe in soup.find_all("iframe"):
         src = iframe.get("src", "").strip()
         if src.startswith("//"): src = "https:" + src
-        
         if src and (src.startswith("http://") or src.startswith("https://")):
             provider_title = detect_player_provider(src)
             found.append({
@@ -270,26 +259,18 @@ def extract_iframes(soup: BeautifulSoup, source_name: str, emoji: str) -> List[D
             })
     return found
 
-# ─────────────────────────────────────────────────────────
-# AKILLI METİN EŞLEŞTİRME VE ARAMA SÜZGECİ
-# ─────────────────────────────────────────────────────────
-
 def get_best_search_result(soup: BeautifulSoup, name: str, video_type: str, domain: str) -> Optional[str]:
     target_slug = to_slug(name)
     target_words = [w for w in target_slug.split("-") if len(w) > 1]
     if not target_words: target_words = [target_slug]
-            
     best_link = None
     max_score = 0
     
     for a in soup.find_all("a", href=True):
         href = a["href"].lower()
-        # Debug Fix: Karşılaştırılan sayfa başlıkları da sluglaştırılarak dil engeli kaldırıldı
         text_slug = to_slug(a.get_text(strip=True))
-        
         if any(x in href for x in ["/kategori/", "/oyuncu/", "/etiket/", "/tur/", "/yapim-yili/", "?s=", "/page/"]):
             continue
-            
         if video_type == "movie" and ("dizi" in href and "film" not in href):
             continue
         if video_type == "series" and ("film" in href and "dizi" not in href and "bolum" not in href):
@@ -299,9 +280,7 @@ def get_best_search_result(soup: BeautifulSoup, name: str, video_type: str, doma
         for word in target_words:
             if word in href: score += 2
             if word in text_slug: score += 2
-                
-        if target_slug in href or target_slug in text_slug:
-            score += 15
+        if target_slug in href or target_slug in text_slug: score += 15
             
         if score > max_score and score > 0:
             max_score = score
@@ -309,13 +288,10 @@ def get_best_search_result(soup: BeautifulSoup, name: str, video_type: str, doma
             
     if best_link and not best_link.startswith("http"):
         best_link = f"{domain.rstrip('/')}/{best_link.lstrip('/')}"
-        
     return best_link
 
 def get_episode_link(soup: BeautifulSoup, domain: str, season: str, episode: str) -> Optional[str]:
     s_num, e_num = int(season), int(episode)
-    
-    # Improvise: Tüm dizi sitelerinin esnek bölüm formatlarını kapsayan dinamik regex kalıbı
     patterns = [
         rf"s0?{s_num}\s?e0?{e_num}\b",
         rf"\b0?{s_num}x0?{e_num}\b",
@@ -327,7 +303,6 @@ def get_episode_link(soup: BeautifulSoup, domain: str, season: str, episode: str
     for a in soup.find_all("a", href=True):
         href = a["href"].lower()
         text = a.get_text(strip=True).lower()
-        
         for c in compiled:
             if c.search(href) or c.search(text):
                 link = a["href"]
@@ -337,14 +312,12 @@ def get_episode_link(soup: BeautifulSoup, domain: str, season: str, episode: str
     return None
 
 # ─────────────────────────────────────────────────────────
-# KÖRSÜZ SCRAPERS (HIZLI-HATA GÜVENLİKLİ)
+# CORE SCRAPERS
 # ─────────────────────────────────────────────────────────
 
 async def scrape_hdfilmcehennemi(name: str, video_type: str, season: Optional[str], episode: Optional[str]) -> List[Dict[str, Any]]:
     streams = []
     domain = await get_domain("hdfilmcehennemi")
-    if not domain: return streams
-    
     search_html = await fetch_html(f"{domain}/?s={urllib.parse.quote_plus(name)}")
     if not search_html: return streams
     
@@ -366,8 +339,6 @@ async def scrape_hdfilmcehennemi(name: str, video_type: str, season: Optional[st
 async def scrape_fullhdfilmizle(name: str, video_type: str, season: Optional[str], episode: Optional[str]) -> List[Dict[str, Any]]:
     streams = []
     domain = await get_domain("fullhdfilmizle")
-    if not domain: return streams
-    
     search_html = await fetch_html(f"{domain}/search?q={urllib.parse.quote_plus(name)}")
     if not search_html: return streams
         
@@ -382,8 +353,6 @@ async def scrape_fullhdfilmizle(name: str, video_type: str, season: Optional[str
 async def scrape_dizipal(name: str, video_type: str, season: Optional[str], episode: Optional[str]) -> List[Dict[str, Any]]:
     streams = []
     domain = await get_domain("dizipal")
-    if not domain: return streams
-    
     search_html = await fetch_html(f"{domain}/?s={urllib.parse.quote_plus(name)}")
     if not search_html: return streams
     
@@ -406,8 +375,6 @@ async def scrape_dizipal(name: str, video_type: str, season: Optional[str], epis
 async def scrape_yabancidizi(name: str, video_type: str, season: Optional[str], episode: Optional[str]) -> List[Dict[str, Any]]:
     streams = []
     domain = await get_domain("yabancidizi")
-    if not domain: return streams
-    
     search_html = await fetch_html(f"{domain}/arama?q={urllib.parse.quote_plus(name)}")
     if not search_html: return streams
         
@@ -432,16 +399,9 @@ async def scrape_yabancidizi(name: str, video_type: str, season: Optional[str], 
 
 @app.on_event("startup")
 async def startup_event():
+    # Render'ı kitlememek için açılışta asenkron çözücüleri tetiklemiyoruz! Sunucu anında açılacak.
     await get_session()
-    if SCRAPE_DO_TOKENS:
-        logger.info(f"✅ Sistem hazır. Toplam {len(SCRAPE_DO_TOKENS)} adet scrape.do tokeni yüklendi.")
-    
-    # Sunucu başlarken arka planda domainleri çözmeye başla (Asenkron)
-    asyncio.create_task(update_live_domain("hdfilmcehennemi"))
-    asyncio.create_task(update_live_domain("fullhdfilmizle"))
-    asyncio.create_task(update_live_domain("dizipal"))
-    asyncio.create_task(update_live_domain("yabancidizi"))
-    logger.info("=== TR Sinema Paketi Prodüksiyon Sürümü Başlatıldı ===")
+    logger.info("=== Render Uyumlu Güvenli TR Sinema Paketi Başlatıldı ===")
 
 @app.get("/")
 def health_check():
@@ -462,7 +422,6 @@ async def get_stream(video_type: str, imdb_id: str):
     season = parts[1] if len(parts) > 1 and video_type == "series" else None
     episode = parts[2] if len(parts) > 2 and video_type == "series" else None
 
-    # Kullanıcının Tam İstediği Öncelik Sıralaması (Maksimum 3 Kaynak Sınırı)
     if video_type == "movie":
         scraper_pipeline = [
             ("HDFilmCehennemi", scrape_hdfilmcehennemi),
@@ -483,12 +442,11 @@ async def get_stream(video_type: str, imdb_id: str):
         try:
             result = await scraper_func(media_name, video_type, season, episode)
             if result:
-                # Kısa Devre (Short-Circuit): İçerik bulundu, döngü kırılıyor. Diğer sitelere İSTEK ATILMAZ!
                 all_streams.extend(result)
-                break 
+                break  # Kısa devre (Maksimum 3 scrape kuralı ve Bütçe Koruma)
         except Exception as e:
-            logger.error(f"❌ {source_name} işlenirken hata oluştu: {e}")
-            # Hata durumunda bir sonraki sorguda domainin taze sıfırlanması için önbellek temizlenir
+            logger.error(f"❌ {source_name} hatası: {e}")
+            # Domain patladıysa bir sonraki istekte taze çözülmesi için cache sıfırlanır
             if source_name == "HDFilmCehennemi": LIVE_DOMAINS["hdfilmcehennemi"] = ""
             elif source_name == "FullHDFilmIzle": LIVE_DOMAINS["fullhdfilmizle"] = ""
             elif source_name == "Dizipal": LIVE_DOMAINS["dizipal"] = ""
